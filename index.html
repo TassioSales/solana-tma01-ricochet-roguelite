@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>ARENA TMA-01: Ricochet &amp; Merge Roguelite</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; }
+    html, body {
+      width: 100%; height: 100%;
+      background: #060913;
+      color: #e2e8f0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      overflow: hidden;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+    #game-container {
+      position: relative;
+      width: 390px;
+      height: 844px;
+      max-width: 100vw;
+      max-height: 100vh;
+      background: radial-gradient(circle at 50% 30%, #111a33 0%, #060913 100%);
+      box-shadow: 0 0 50px rgba(0, 240, 255, 0.15);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    canvas {
+      display: block;
+      width: 390px;
+      height: 844px;
+    }
+    #hud {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      right: 16px;
+      display: flex;
+      justify-content: space-between;
+      pointer-events: none;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      font-size: 14px;
+      text-shadow: 0 0 8px rgba(0, 255, 200, 0.6);
+    }
+    .hud-val { color: #00ffcc; font-size: 18px; }
+  </style>
+</head>
+<body>
+  <div id="game-container">
+    <div id="hud">
+      <div>WAVE: <span id="hud-wave" class="hud-val">1</span></div>
+      <div>COMBO: <span id="hud-combo" class="hud-val">x1</span></div>
+      <div>SCORE: <span id="hud-score" class="hud-val">0</span></div>
+    </div>
+    <canvas id="canvas" width="390" height="844"></canvas>
+  </div>
+
+  <script>
+    (function () {
+      const W = 390;
+      const H = 844;
+      const canvas = document.getElementById('canvas');
+      const ctx = canvas.getContext('2d');
+      const hudWave = document.getElementById('hud-wave');
+      const hudCombo = document.getElementById('hud-combo');
+      const hudScore = document.getElementById('hud-score');
+
+      // WebAudio Synthesizer (Procedural, 0 external audio files)
+      let audioCtx = null;
+      function playSynth(type, freq, duration, gainVal = 0.1) {
+        if (!audioCtx) {
+          const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+          if (AudioContextClass) audioCtx = new AudioContextClass();
+        }
+        if (!audioCtx || audioCtx.state !== 'running') return;
+        try {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = type;
+          osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+          if (type === 'sawtooth') {
+            osc.frequency.exponentialRampToValueAtTime(Math.max(40, freq * 0.3), audioCtx.currentTime + duration);
+          }
+          gain.gain.setValueAtTime(gainVal, audioCtx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + duration);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start();
+          osc.stop(audioCtx.currentTime + duration);
+        } catch (_) {}
+      }
+
+      // Deterministic PRNG: Mulberry32
+      let prngState = 42;
+      function rnd() {
+        let t = (prngState += 0x6D2B79F5);
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      }
+      function rndRange(min, max) { return min + rnd() * (max - min); }
+      function rndInt(min, max) { return Math.floor(rndRange(min, max + 1)); }
+
+      // Game State
+      let wave = 1;
+      let score = 0;
+      let combo = 0;
+      let comboTimer = 0;
+      let phase = 'aim'; // 'aim', 'flying', 'draft', 'revive', 'game_over'
+      let gameOver = false;
+      let awaitingRevive = false;
+      let screenShake = 0;
+
+      // Cannon & Aiming
+      const canonX = W / 2;
+      const canonY = 740;
+      let aimX = W / 2;
+      let aimY = 500;
+      let isAiming = false;
+      let ballsToFire = 0;
+      let fireCooldown = 0;
+      let ballDamage = 1;
+      let ballCountMax = 15;
+      let ballSpeed = 650;
+      let pierceCount = 0;
+      let mergeMultiplier = 1;
+
+      // Entities
+      let balls = [];
+      let blocks = [];
+      let mergeOrbs = [];
+      let particles = [];
+      let draftCards = [];
+
+      function resetGame(seed) {
+        prngState = (seed >>> 0) || 42;
+        wave = 1;
+        score = 0;
+        combo = 0;
+        comboTimer = 0;
+        phase = 'aim';
+        gameOver = false;
+        awaitingRevive = false;
+        screenShake = 0;
+        aimX = W / 2;
+        aimY = 500;
+        isAiming = false;
+        ballsToFire = 0;
+        fireCooldown = 0;
+        ballDamage = 1;
+        ballCountMax = 12;
+        ballSpeed = 680;
+        pierceCount = 0;
+        mergeMultiplier = 1;
+        balls = [];
+        blocks = [];
+        mergeOrbs = [];
+        particles = [];
+        draftCards = [];
+        spawnWave();
+      }
+
+      function spawnWave() {
+        const rows = Math.min(4, 2 + Math.floor(wave / 3));
+        const cols = 6;
+        const blockW = 54;
+        const blockH = 34;
+        const startX = 22;
+        const startY = 80;
+
+        for (let r = 0; r < rows; r++) {
+          for (let c = 0; c < cols; c++) {
+            if (rnd() > 0.35) {
+              const maxHp = rndInt(wave * 2, wave * 6);
+              const isExplosive = rnd() < 0.15;
+              const isMergePylon = !isExplosive && rnd() < 0.18;
+              blocks.push({
+                x: startX + c * (blockW + 6),
+                y: startY + r * (blockH + 8),
+                w: blockW,
+                h: blockH,
+                hp: maxHp,
+                maxHp: maxHp,
+                explosive: isExplosive,
+                pylon: isMergePylon,
+                hue: isExplosive ? 0 : isMergePylon ? 280 : 180 + (wave * 12) % 120
+              });
+            }
+          }
+        }
+        if (rnd() > 0.4) {
+          mergeOrbs.push({
+            x: rndRange(50, W - 50),
+            y: rndRange(startY, startY + rows * 42),
+            r: 14,
+            mult: 2,
+            active: true
+          });
+        }
+      }
+
+      function createExplosion(x, y, color, count = 16) {
+        for (let i = 0; i < count; i++) {
+          const ang = rnd() * Math.PI * 2;
+          const spd = rndRange(60, 220);
+          particles.push({
+            x, y,
+            vx: Math.cos(ang) * spd,
+            vy: Math.sin(ang) * spd,
+            life: rndRange(0.2, 0.5),
+            maxLife: 0.5,
+            color,
+            r: rndRange(2, 4)
+          });
+        }
+      }
+
+      function startDraft() {
+        phase = 'draft';
+        draftCards = [
+          { title: '+4 Balls', desc: 'Add 4 extra kinetic shots per volley', apply: () => { ballCountMax += 4; } },
+          { title: 'Merge Core', desc: 'Drop-merge multiplies damage x2', apply: () => { mergeMultiplier += 1; } },
+          { title: 'Piercing Arc', desc: 'Projectiles pierce through blocks', apply: () => { pierceCount += 1; } }
+        ];
+      }
+
+      function applyDraft(choiceIdx) {
+        const c = draftCards[choiceIdx % draftCards.length];
+        if (c) c.apply();
+        draftCards = [];
+        wave++;
+        // Advance blocks downward
+        for (const b of blocks) {
+          b.y += 44;
+          if (b.y + b.h >= canonY - 20) {
+            triggerReviveOrDefeat();
+            return;
+          }
+        }
+        spawnWave();
+        phase = 'aim';
+      }
+
+      function triggerReviveOrDefeat() {
+        if (!awaitingRevive) {
+          awaitingRevive = true;
+          phase = 'revive';
+        } else {
+          gameOver = true;
+          phase = 'game_over';
+        }
+      }
+
+      function revivePlayer() {
+        awaitingRevive = false;
+        // Shield pulse: clear bottom half of blocks
+        blocks = blocks.filter(b => b.y < canonY - 140);
+        phase = 'aim';
+        screenShake = 14;
+      }
+
+      function fireVolley() {
+        let dx = aimX - canonX;
+        let dy = aimY - canonY;
+        const len = Math.hypot(dx, dy) || 1;
+        dx = (dx / len);
+        dy = (dy / len);
+        // Ensure aiming upwards
+        if (dy > -0.15) dy = -0.15;
+        const nlen = Math.hypot(dx, dy);
+        dx /= nlen;
+        dy /= nlen;
+
+        ballsToFire = ballCountMax;
+        fireCooldown = 0;
+        phase = 'flying';
+        isAiming = false;
+        playSynth('sine', 480, 0.08, 0.08);
+      }
+
+      function stepSim(dtMs, input) {
+        const dt = Math.min(dtMs / 1000, 0.05);
+
+        // Shake decay
+        if (screenShake > 0) screenShake = Math.max(0, screenShake - dt * 25);
+
+        // Handle Input
+        if (input) {
+          if (phase === 'aim') {
+            if (input.down) {
+              isAiming = true;
+              aimX = input.x * W;
+              aimY = input.y * H;
+            } else if (input.tap || (isAiming && !input.down)) {
+              if (input.x !== undefined && input.y !== undefined) {
+                aimX = input.x * W;
+                aimY = input.y * H;
+              }
+              fireVolley();
+            }
+          } else if (phase === 'draft') {
+            if (input.choice !== null && input.choice !== undefined) {
+              applyDraft(input.choice);
+            } else if (input.tap) {
+              const ch = Math.floor(input.y * 3);
+              applyDraft(ch);
+            }
+          } else if (phase === 'revive') {
+            if (input.tap) revivePlayer();
+          }
+        }
+
+        // Firing stream
+        if (ballsToFire > 0) {
+          fireCooldown -= dt;
+          if (fireCooldown <= 0) {
+            fireCooldown = 0.055;
+            ballsToFire--;
+            let dx = aimX - canonX;
+            let dy = aimY - canonY;
+            if (dy > -0.15) dy = -0.15;
+            const len = Math.hypot(dx, dy);
+            balls.push({
+              x: canonX,
+              y: canonY,
+              vx: (dx / len) * ballSpeed,
+              vy: (dy / len) * ballSpeed,
+              r: 5,
+              dmg: ballDamage * mergeMultiplier,
+              pierce: pierceCount,
+              active: true
+            });
+          }
+        }
+
+        // Move balls
+        for (const ball of balls) {
+          if (!ball.active) continue;
+          ball.x += ball.vx * dt;
+          ball.y += ball.vy * dt;
+
+          // Wall Ricochet
+          if (ball.x - ball.r < 0) {
+            ball.x = ball.r;
+            ball.vx = -ball.vx;
+            playSynth('triangle', 320, 0.03, 0.03);
+          } else if (ball.x + ball.r > W) {
+            ball.x = W - ball.r;
+            ball.vx = -ball.vx;
+            playSynth('triangle', 320, 0.03, 0.03);
+          }
+          // Ceiling Ricochet
+          if (ball.y - ball.r < 0) {
+            ball.y = ball.r;
+            ball.vy = -ball.vy;
+            playSynth('triangle', 380, 0.03, 0.03);
+          }
+          // Floor Exit
+          if (ball.y - ball.r > H) {
+            ball.active = false;
+          }
+
+          // Merge Orb Interaction
+          for (const orb of mergeOrbs) {
+            if (!orb.active) continue;
+            const dist = Math.hypot(ball.x - orb.x, ball.y - orb.y);
+            if (dist < ball.r + orb.r) {
+              ball.dmg *= orb.mult;
+              ball.r = Math.min(10, ball.r + 1.5);
+              createExplosion(orb.x, orb.y, '#e056fd', 8);
+              playSynth('sine', 840, 0.1, 0.1);
+              orb.active = false;
+            }
+          }
+
+          // Block Collision
+          for (const block of blocks) {
+            if (block.hp <= 0) continue;
+            const cx = Math.max(block.x, Math.min(ball.x, block.x + block.w));
+            const cy = Math.max(block.y, Math.min(ball.y, block.y + block.h));
+            const dx = ball.x - cx;
+            const dy = ball.y - cy;
+            const distSq = dx * dx + dy * dy;
+
+            if (distSq < ball.r * ball.r) {
+              block.hp -= ball.dmg;
+              score += 10 * (combo + 1);
+              combo++;
+              comboTimer = 1.2;
+              screenShake = Math.min(8, screenShake + 1.2);
+
+              if (ball.pierce <= 0) {
+                if (Math.abs(dx) > Math.abs(dy)) ball.vx = -ball.vx;
+                else ball.vy = -ball.vy;
+              } else {
+                ball.pierce--;
+              }
+
+              playSynth('square', 240 + combo * 10, 0.04, 0.05);
+              createExplosion(ball.x, ball.y, `hsl(${block.hue}, 90%, 60%)`, 5);
+
+              if (block.hp <= 0) {
+                score += 50;
+                createExplosion(block.x + block.w / 2, block.y + block.h / 2, '#00ffff', 16);
+                if (block.explosive) {
+                  playSynth('sawtooth', 120, 0.25, 0.2);
+                  for (const nb of blocks) {
+                    if (nb.hp > 0 && Math.hypot(nb.x - block.x, nb.y - block.y) < 110) {
+                      nb.hp -= 20;
+                      score += 25;
+                    }
+                  }
+                }
+              }
+              break;
+            }
+          }
+        }
+
+        // Filter active balls
+        balls = balls.filter(b => b.active);
+        blocks = blocks.filter(b => b.hp > 0);
+        mergeOrbs = mergeOrbs.filter(o => o.active);
+
+        // Combo timeout
+        if (comboTimer > 0) {
+          comboTimer -= dt;
+          if (comboTimer <= 0) combo = 0;
+        }
+
+        // Particles update
+        for (const p of particles) {
+          p.x += p.vx * dt;
+          p.y += p.vy * dt;
+          p.life -= dt;
+        }
+        particles = particles.filter(p => p.life > 0);
+
+        // Check wave clear or all balls returned
+        if (phase === 'flying' && ballsToFire === 0 && balls.length === 0) {
+          if (blocks.length === 0) {
+            startDraft();
+          } else {
+            phase = 'aim';
+          }
+        }
+
+        // Render Frame
+        renderFrame();
+
+        // Update DOM HUD if present
+        if (hudWave) hudWave.textContent = wave;
+        if (hudCombo) hudCombo.textContent = 'x' + Math.max(1, combo);
+        if (hudScore) hudScore.textContent = score;
+      }
+
+      function renderFrame() {
+        ctx.save();
+        if (screenShake > 0) {
+          ctx.translate(rndRange(-screenShake, screenShake), rndRange(-screenShake, screenShake));
+        }
+
+        // Clear Background
+        ctx.fillStyle = '#060913';
+        ctx.fillRect(0, 0, W, H);
+
+        // Neon Grid Lines
+        ctx.strokeStyle = 'rgba(0, 240, 255, 0.05)';
+        ctx.lineWidth = 1;
+        for (let x = 0; x < W; x += 30) {
+          ctx.beginPath();
+          ctx.moveTo(x, 0);
+          ctx.lineTo(x, H);
+          ctx.stroke();
+        }
+        for (let y = 0; y < H; y += 30) {
+          ctx.beginPath();
+          ctx.moveTo(0, y);
+          ctx.lineTo(W, y);
+          ctx.stroke();
+        }
+
+        // Blocks
+        for (const b of blocks) {
+          ctx.fillStyle = `hsl(${b.hue}, 80%, 45%)`;
+          ctx.strokeStyle = `hsl(${b.hue}, 100%, 75%)`;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.roundRect(b.x, b.y, b.w, b.h, 6);
+          ctx.fill();
+          ctx.stroke();
+
+          // HP Text
+          ctx.fillStyle = '#ffffff';
+          ctx.font = 'bold 12px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(b.hp, b.x + b.w / 2, b.y + b.h / 2);
+        }
+
+        // Merge Orbs
+        for (const orb of mergeOrbs) {
+          ctx.fillStyle = '#e056fd';
+          ctx.shadowColor = '#e056fd';
+          ctx.shadowBlur = 12;
+          ctx.beginPath();
+          ctx.arc(orb.x, orb.y, orb.r, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.shadowBlur = 0;
+          ctx.fillStyle = '#fff';
+          ctx.font = 'bold 10px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText('x2', orb.x, orb.y);
+        }
+
+        // Balls
+        for (const ball of balls) {
+          ctx.fillStyle = '#00f0ff';
+          ctx.shadowColor = '#00f0ff';
+          ctx.shadowBlur = 8;
+          ctx.beginPath();
+          ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.shadowBlur = 0;
+        }
+
+        // Particles
+        for (const p of particles) {
+          ctx.fillStyle = p.color;
+          ctx.globalAlpha = p.life / p.maxLife;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.globalAlpha = 1.0;
+        }
+
+        // Aiming Trajectory
+        if (phase === 'aim') {
+          ctx.strokeStyle = 'rgba(0, 255, 200, 0.45)';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([6, 6]);
+          ctx.beginPath();
+          ctx.moveTo(canonX, canonY);
+          let dx = aimX - canonX;
+          let dy = aimY - canonY;
+          if (dy > -0.15) dy = -0.15;
+          const len = Math.hypot(dx, dy) || 1;
+          ctx.lineTo(canonX + (dx / len) * 220, canonY + (dy / len) * 220);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+
+        // Cannon Turret
+        ctx.fillStyle = '#1e293b';
+        ctx.strokeStyle = '#00ffcc';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(canonX, canonY, 22, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+
+        // Draft Card Overlay
+        if (phase === 'draft') {
+          ctx.fillStyle = 'rgba(4, 7, 18, 0.88)';
+          ctx.fillRect(0, 0, W, H);
+          ctx.fillStyle = '#00ffcc';
+          ctx.font = 'bold 22px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText('ROGUELITE UPGRADE', W / 2, 160);
+
+          for (let i = 0; i < draftCards.length; i++) {
+            const cy = 240 + i * 150;
+            ctx.fillStyle = '#0f172a';
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.roundRect(40, cy, W - 80, 120, 10);
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.fillStyle = '#38bdf8';
+            ctx.font = 'bold 16px sans-serif';
+            ctx.fillText(draftCards[i].title, W / 2, cy + 40);
+
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '13px sans-serif';
+            ctx.fillText(draftCards[i].desc, W / 2, cy + 75);
+          }
+        }
+
+        // Near-Miss Revive Overlay
+        if (phase === 'revive') {
+          ctx.fillStyle = 'rgba(25, 0, 10, 0.85)';
+          ctx.fillRect(0, 0, W, H);
+          ctx.fillStyle = '#ff0055';
+          ctx.font = 'bold 26px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText('NEAR MISS!', W / 2, 340);
+          ctx.fillStyle = '#fff';
+          ctx.font = '16px sans-serif';
+          ctx.fillText('Tap to trigger Shield Pulse & Continue', W / 2, 400);
+        }
+
+        // Game Over Overlay
+        if (phase === 'game_over') {
+          ctx.fillStyle = 'rgba(5, 5, 10, 0.92)';
+          ctx.fillRect(0, 0, W, H);
+          ctx.fillStyle = '#ef4444';
+          ctx.font = 'bold 28px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText('MISSION FAILED', W / 2, 360);
+          ctx.fillStyle = '#e2e8f0';
+          ctx.font = '16px sans-serif';
+          ctx.fillText(`Final Wave: ${wave}  Score: ${score}`, W / 2, 410);
+        }
+
+        ctx.restore();
+      }
+
+      // Initial Setup
+      resetGame(42);
+
+      // Mouse / Touch Event Listeners for standalone play
+      let dragging = false;
+      function getPos(e) {
+        const rect = canvas.getBoundingClientRect();
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        return {
+          x: (clientX - rect.left) / rect.width,
+          y: (clientY - rect.top) / rect.height
+        };
+      }
+      canvas.addEventListener('mousedown', e => { dragging = true; const p = getPos(e); stepSim(0, { x: p.x, y: p.y, down: true, tap: false, choice: null }); });
+      window.addEventListener('mousemove', e => { if (dragging) { const p = getPos(e); stepSim(0, { x: p.x, y: p.y, down: true, tap: false, choice: null }); } });
+      window.addEventListener('mouseup', e => { if (dragging) { dragging = false; const p = getPos(e); stepSim(0, { x: p.x, y: p.y, down: false, tap: true, choice: null }); } });
+      canvas.addEventListener('touchstart', e => { dragging = true; const p = getPos(e); stepSim(0, { x: p.x, y: p.y, down: true, tap: false, choice: null }); e.preventDefault(); }, { passive: false });
+      window.addEventListener('touchmove', e => { if (dragging) { const p = getPos(e); stepSim(0, { x: p.x, y: p.y, down: true, tap: false, choice: null }); } });
+      window.addEventListener('touchend', e => { if (dragging) { dragging = false; stepSim(0, { x: 0.5, y: 0.5, down: false, tap: true, choice: null }); } });
+
+      // RequestAnimationFrame loop for standalone interactive testing
+      let lastTime = performance.now();
+      function loop(now) {
+        const dt = Math.min(32, now - lastTime);
+        lastTime = now;
+        stepSim(dt, null);
+        requestAnimationFrame(loop);
+      }
+      requestAnimationFrame(loop);
+
+      // Deterministic Headless Benchmark Bridge (window.__GAME)
+      window.__GAME = {
+        reset: function (seed) {
+          resetGame(seed);
+        },
+        step: function (dtMs, input) {
+          stepSim(dtMs, input);
+        },
+        state: function () {
+          return {
+            phase: phase,
+            wave: wave,
+            score: score,
+            entities: balls.length + blocks.length + mergeOrbs.length,
+            combo: combo,
+            game_over: gameOver,
+            awaiting_revive: awaitingRevive
+          };
+        }
+      };
+    })();
+  </script>
+</body>
+</html>

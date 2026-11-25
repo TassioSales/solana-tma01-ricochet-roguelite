@@ -1,0 +1,11 @@
+{
+  "name": "solana-tma01-ricochet-roguelite",
+  "version": "1.0.0",
+  "description": "TMA-01 9:16 One-Thumb Physics Ricochet and Merge Roguelite Mini-Game",
+  "main": "index.html",
+  "scripts": {
+    "test": "node verify_tma01.mjs"
+  },
+  "author": "TassioSales",
+  "license": "MIT"
+}
